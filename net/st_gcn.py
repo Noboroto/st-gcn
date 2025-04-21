@@ -5,6 +5,8 @@ from torch.autograd import Variable
 
 from net.utils.tgcn import ConvTemporalGraphical
 from net.utils.graph import Graph
+from net.utils.attention import STAttention
+
 
 class Model(nn.Module):
     r"""Spatial temporal graph convolutional networks.
@@ -15,6 +17,7 @@ class Model(nn.Module):
         graph_args (dict): The arguments for building the graph
         edge_importance_weighting (bool): If ``True``, adds a learnable
             importance weighting to the edges of the graph
+        use_attention (bool): If ``True``, adds attention mechanisms to the network
         **kwargs (optional): Other parameters for graph convolution units
 
     Shape:
@@ -27,13 +30,17 @@ class Model(nn.Module):
     """
 
     def __init__(self, in_channels, num_class, graph_args,
-                 edge_importance_weighting, **kwargs):
+                 edge_importance_weighting, use_attention=True, **kwargs):
         super().__init__()
 
         # load graph
         self.graph = Graph(**graph_args)
-        A = torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False)
+        A = torch.tensor(self.graph.A, dtype=torch.float32,
+                         requires_grad=False)
         self.register_buffer('A', A)
+
+        # Parameter to control attention usage
+        self.use_attention = use_attention
 
         # build networks
         spatial_kernel_size = A.size(0)
@@ -53,6 +60,14 @@ class Model(nn.Module):
             st_gcn(256, 256, kernel_size, 1, **kwargs),
             st_gcn(256, 256, kernel_size, 1, **kwargs),
         ))
+
+        # attention modules after certain st-gcn blocks
+        if self.use_attention:
+            self.attentions = nn.ModuleList([
+                STAttention(64, reduction=8),
+                STAttention(128, reduction=8),
+                STAttention(256, reduction=8)
+            ])
 
         # initialize parameters for edge importance weighting
         if edge_importance_weighting:
@@ -77,9 +92,15 @@ class Model(nn.Module):
         x = x.permute(0, 1, 3, 4, 2).contiguous()
         x = x.view(N * M, C, T, V)
 
-        # forwad
-        for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
+        # forward
+        attention_idx = 0
+        for i, (gcn, importance) in enumerate(zip(self.st_gcn_networks, self.edge_importance)):
             x, _ = gcn(x, self.A * importance)
+
+            # Apply attention at specific layers (after layers 3, 6, and 9)
+            if self.use_attention and i in [3, 6, 9]:
+                x = self.attentions[attention_idx](x)
+                attention_idx += 1
 
         # global pooling
         x = F.avg_pool2d(x, x.size()[2:])
@@ -102,9 +123,18 @@ class Model(nn.Module):
         x = x.permute(0, 1, 3, 4, 2).contiguous()
         x = x.view(N * M, C, T, V)
 
-        # forwad
-        for gcn, importance in zip(self.st_gcn_networks, self.edge_importance):
+        # forward
+        feature_list = []
+        attention_idx = 0
+        for i, (gcn, importance) in enumerate(zip(self.st_gcn_networks, self.edge_importance)):
             x, _ = gcn(x, self.A * importance)
+
+            # Apply attention at specific layers (after layers 3, 6, and 9)
+            if self.use_attention and i in [3, 6, 9]:
+                x = self.attentions[attention_idx](x)
+                attention_idx += 1
+                # Save for visualization
+                feature_list.append(x)
 
         _, c, t, v = x.size()
         feature = x.view(N, M, c, t, v).permute(0, 2, 3, 4, 1)
@@ -115,6 +145,7 @@ class Model(nn.Module):
 
         return output, feature
 
+
 class st_gcn(nn.Module):
     r"""Applies a spatial temporal graph convolution over an input graph sequence.
 
@@ -123,7 +154,7 @@ class st_gcn(nn.Module):
         out_channels (int): Number of channels produced by the convolution
         kernel_size (tuple): Size of the temporal convolving kernel and graph convolving kernel
         stride (int, optional): Stride of the temporal convolution. Default: 1
-        dropout (int, optional): Dropout rate of the final output. Default: 0
+        dropout (int, optional): Dropout rate of the final output. Default: 0.2
         residual (bool, optional): If ``True``, applies a residual mechanism. Default: ``True``
 
     Shape:
@@ -145,7 +176,7 @@ class st_gcn(nn.Module):
                  out_channels,
                  kernel_size,
                  stride=1,
-                 dropout=0,
+                 dropout=0.2,  # Changed default from 0.5 to 0.2
                  residual=True):
         super().__init__()
 
